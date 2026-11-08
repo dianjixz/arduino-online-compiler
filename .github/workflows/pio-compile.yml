@@ -1,0 +1,186 @@
+name: Arduino Compile
+
+on:
+  workflow_dispatch:
+    inputs:
+      encoded_ini:
+        description: Base64 编码的 platformio.ini 内容
+        required: true
+        type: string
+      encoded_sketch:
+        description: Base64 编码的 src/main.cpp 内容
+        required: true
+        type: string
+      request_id:
+        description: 用于标识此次编译请求的唯一 ID
+        required: true
+        type: string
+      artifact_password:
+        description: 下载固件压缩包所需的密码
+        required: true
+        type: string
+      pio_version:
+        description: PlatformIO Core 版本（例如 6.1.18），留空则安装最新版
+        required: false
+        type: string
+
+run-name: >-
+  Arduino compile • ${{ inputs.request_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      REQUEST_ID: ${{ inputs.request_id }}
+      PLATFORMIO_CORE_DIR: ${{ github.workspace }}/.platformio
+      PLATFORMIO_SETTING_ENABLE_TELEMETRY: 'false'
+      PLATFORMIO_DISABLE_PROGRESSBAR: 'true'
+      CI: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decode project
+        id: decode
+        run: |
+          set -eo pipefail
+          event_path="$GITHUB_EVENT_PATH"
+          project_dir="$GITHUB_WORKSPACE/project"
+
+          ini="$(jq -r '.inputs.encoded_ini' "$event_path")"
+          sketch="$(jq -r '.inputs.encoded_sketch' "$event_path")"
+          password="$(jq -r '.inputs.artifact_password' "$event_path")"
+
+          for value in "$ini" "$sketch" "$password"; do
+            if [[ -z "$value" || "$value" == "null" ]]; then
+              echo "Missing required workflow input" >&2
+              exit 1
+            fi
+          done
+
+          echo "::add-mask::$password"
+
+          mkdir -p "$project_dir/src"
+          printf '%s' "$ini" | base64 --decode > "$project_dir/platformio.ini"
+          printf '%s' "$sketch" | base64 --decode > "$project_dir/src/main.cpp"
+
+          # 后端已经校验过一次，这里再兜一层，避免绕过 API 直接触发工作流
+          if ! grep -qE '^\[env:' "$project_dir/platformio.ini"; then
+            echo "platformio.ini 中缺少 [env:] 环境段" >&2
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*(extra_scripts|platform_packages)[[:space:]]*=' "$project_dir/platformio.ini"; then
+            echo "platformio.ini 不允许包含 extra_scripts / platform_packages" >&2
+            exit 1
+          fi
+          if grep -vE '^[[:space:]]*[;#]' "$project_dir/platformio.ini" | grep -qE 'https?://'; then
+            echo "platformio.ini 不允许包含远程地址，请使用 registry 名称与版本号" >&2
+            exit 1
+          fi
+
+          echo "platformio.ini bytes: $(wc -c < "$project_dir/platformio.ini")"
+          echo "main.cpp bytes: $(wc -c < "$project_dir/src/main.cpp")"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: .platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('project/platformio.ini') }}-${{ inputs.pio_version || 'latest' }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: |
+          set -eo pipefail
+          python3 -m pip install --upgrade pip
+          version="$(jq -r '.inputs.pio_version // ""' "$GITHUB_EVENT_PATH")"
+          if [[ -n "$version" ]]; then
+            echo "Installing PlatformIO Core $version"
+            python3 -m pip install "platformio==$version"
+          else
+            echo "Installing latest PlatformIO Core"
+            python3 -m pip install platformio
+          fi
+          pio --version
+
+      - name: Build firmware
+        id: build
+        run: |
+          set -eo pipefail
+          log="$RUNNER_TEMP/pio-build.log"
+          : > "$log"
+
+          set +e
+          pio run -d project --no-ansi 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          cp "$log" "$GITHUB_WORKSPACE/pio-build.log"
+          exit "$status"
+
+      - name: Collect firmware images
+        if: steps.build.outcome == 'success'
+        run: bash scripts/collect-artifacts.sh project bundle
+
+      - name: Add build log
+        if: steps.build.outcome == 'success'
+        run: cp "$RUNNER_TEMP/pio-build.log" bundle/build.log
+
+      - name: Package firmware
+        if: steps.build.outcome == 'success'
+        run: |
+          set -eo pipefail
+          password="$(jq -r '.inputs.artifact_password' "$GITHUB_EVENT_PATH")"
+          mkdir -p artifact
+          (
+            cd bundle
+            zip -qr -P "$password" "../artifact/firmware-${REQUEST_ID}-password.zip" .
+          )
+          ls -lh artifact
+
+      - name: Upload firmware artifact
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.REQUEST_ID }}
+          path: artifact
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Publish summary
+        if: always()
+        run: |
+          summary="$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "### Arduino 编译结果"
+            echo
+            echo "- 请求 ID：\`$REQUEST_ID\`"
+            echo "- PlatformIO：${{ inputs.pio_version || '最新版' }}"
+            echo "- 编译状态：${{ job.status }}"
+            echo "- 压缩包：\`artifact/firmware-$REQUEST_ID-password.zip\`（下载后需使用页面展示的密码解压）"
+            echo
+            echo "下载产物：Workflow 运行页底部的 \`firmware-$REQUEST_ID\` Artifacts。"
+          } >> "$summary"
+
+          if [[ '${{ job.status }}' != 'success' ]]; then
+            {
+              echo
+              echo "#### 编译错误日志（尾部）"
+              echo
+              echo '```'
+              if [[ -f "${RUNNER_TEMP}/pio-build.log" ]]; then
+                tail -n 60 "${RUNNER_TEMP}/pio-build.log"
+              else
+                echo "（未找到编译日志）"
+              fi
+              echo '```'
+            } >> "$summary"
+          fi
