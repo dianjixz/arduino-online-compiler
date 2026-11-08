@@ -41,6 +41,7 @@ jobs:
       PLATFORMIO_CORE_DIR: ${{ github.workspace }}/.platformio
       PLATFORMIO_SETTING_ENABLE_TELEMETRY: 'false'
       PLATFORMIO_DISABLE_PROGRESSBAR: 'true'
+      PLATFORMIO_NO_ANSI: 'true'
       CI: 'true'
 
     steps:
@@ -118,11 +119,16 @@ jobs:
           : > "$log"
 
           set +e
-          pio run -d project --no-ansi 2>&1 | tee -a "$log"
+          pio run -d project 2>&1 | tee -a "$log"
           status=${PIPESTATUS[0]}
           set -e
 
           cp "$log" "$GITHUB_WORKSPACE/pio-build.log"
+          if [[ "$status" -ne 0 ]]; then
+            # 失败时把日志尾部打成公开 annotation，方便没有日志下载权限时排查
+            tail_text="$(tail -n 20 "$log" | tr '\n' '|' | sed 's/::/%3A%3A/g')"
+            echo "::error title=pio run failed (exit $status)::${tail_text}"
+          fi
           exit "$status"
 
       - name: Collect firmware images
