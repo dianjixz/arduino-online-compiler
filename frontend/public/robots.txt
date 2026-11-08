@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://arduino-online-compiler.pages.dev/sitemap.xml
