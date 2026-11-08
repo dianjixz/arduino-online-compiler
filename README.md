@@ -101,8 +101,8 @@ firmware-<request_id>-password.zip
 └── <env>/
     ├── firmware.bin / firmware.hex / firmware.uf2
     ├── firmware.elf
-    ├── bootloader.bin, partitions.bin, boot_app0.bin   （ESP32 系）
-    ├── merged-0x0.bin        ← 单文件镜像（esptool merge_bin 生成，直刷 0x0）
+    ├── bootloader.bin, partitions.bin, boot_app0.bin   （ESP32 系；boot_app0.bin 自动取自 Arduino 框架包）
+    ├── merged-0x0.bin        ← 单文件镜像（含 bootloader/分区表/boot_app0/应用，直刷 0x0）
     └── flash_args.txt        ← 现成的 esptool / avrdude 命令
 └── build.log
 └── BUILD-INFO.txt
@@ -111,8 +111,18 @@ firmware-<request_id>-password.zip
 `flash_args.txt` 示例：
 
 ```bash
+# 方式一（推荐）
 esptool.py --chip esp32 -p COM_PORT -b 460800 write_flash 0x0 merged-0x0.bin
+
+# 方式二（分段）
+esptool.py --chip esp32 -p COM_PORT -b 460800 write_flash 0x1000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
 ```
+
+> **刷机注意（ESP32 系）**：`0xe000` 的 `boot_app0.bin` 会初始化 otadata，让 bootloader 启动你刚写入的 app0。如果设备**此前跑过别的 OTA 固件**，只写 `0x10000` 的 `firmware.bin`、不写 `boot_app0.bin` 时，bootloader 可能继续启动旧的 app1（现象：刷完没输出、跑的还是老固件）。稳妥做法是刷 `merged-0x0.bin`，或按方式二带上 `0xe000 boot_app0.bin`；也可以先执行：
+>
+> ```bash
+> esptool.py --chip esp32 -p COM_PORT erase_region 0xe000 0x2000
+> ```
 
 ## 安全说明
 
@@ -129,4 +139,5 @@ esptool.py --chip esp32 -p COM_PORT -b 460800 write_flash 0x0 merged-0x0.bin
 | `Unknown board ID` | `board` 写了平台里不存在的名字；先用 `pio boards espressif32` 查 |
 | `Could not find a version that satisfies the requirement platformio==x.y.z` | 版本号写错或该版本不存在，清空版本框用最新版即可 |
 | 编译超时 | 工作流超时 25 分钟；首次编译需要下载平台与工具链，缓存命中后会快很多 |
-| 产物里没有 `merged-0x0.bin` | 8266/AVR 平台没有分段镜像，直接看 `flash_args.txt` |
+| 产物里没有 `merged-0x0.bin` | 看 CI 日志里的 `merged image skipped ...` 原因：ESP8266/AVR 无分段镜像、esptool 未找到、或合并失败；分段 bins 和 `flash_args.txt` 仍然可用 |
+| 刷完设备没输出 / 跑的仍是旧固件 | 设备之前跑过 OTA 固件，otadata 指向旧 app1；刷 `0xe000 boot_app0.bin`、改用 `merged-0x0.bin`，或 `esptool.py erase_region 0xe000 0x2000` 后重新刷 |
